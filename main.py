@@ -25,6 +25,8 @@ DATA_DIR, IMAGE_DIR = ROOT / "data", ROOT / "data" / "cards"
 DB_PATH = DATA_DIR / "flashcards.db"
 WIDTH, HEIGHT = 400, 300
 BLACK, WHITE, RED = (0, 0, 0), (255, 255, 255), (210, 30, 45)
+EPD_PANEL_TYPE, EPD_COLOR_MODE = "gdey042z98", "tricolor"
+EPD_FRAME_BYTES = WIDTH * HEIGHT // 4
 VOWELS = set("aeiouAEIOU")
 BATCH_RUNNING = False
 MAX_CARD_HINT_LENGTH = 52
@@ -384,6 +386,34 @@ def image_filename(word: str) -> str:
     return f"{name or 'flashcard'}.png"
 
 
+def nearest_epd_colour(pixel: tuple[int, int, int]) -> tuple[int, tuple[int, int, int]]:
+    """Return the ESP32 2-bit colour code for the 4.2-inch tri-colour panel."""
+    choices = ((0, WHITE), (2, RED), (3, BLACK))
+    return min(
+        choices,
+        key=lambda choice: sum(
+            (component - target) ** 2 for component, target in zip(pixel, choice[1])
+        ),
+    )
+
+
+def epd_frame(image_path: Path) -> bytes:
+    """Pack a PNG into the four-pixels-per-byte format expected by /api/frame."""
+    with Image.open(image_path) as source:
+        image = source.convert("RGB")
+    if image.size != (WIDTH, HEIGHT):
+        image = ImageOps.contain(image, (WIDTH, HEIGHT))
+        canvas = Image.new("RGB", (WIDTH, HEIGHT), WHITE)
+        canvas.paste(image, ((WIDTH - image.width) // 2, (HEIGHT - image.height) // 2))
+        image = canvas
+
+    frame = bytearray(EPD_FRAME_BYTES)
+    for index, pixel in enumerate(image.getdata()):
+        code, _ = nearest_epd_colour(pixel)
+        frame[index // 4] |= code << (6 - (index % 4) * 2)
+    return bytes(frame)
+
+
 def compose_card(card: sqlite3.Row, illustration: Image.Image) -> Path:
     canvas = Image.new("RGB", (WIDTH, HEIGHT), WHITE)
     draw = ImageDraw.Draw(canvas)
@@ -546,24 +576,33 @@ async def upload_to_epd(card_id: int) -> dict:
     if not card["image_path"] or not Path(card["image_path"]).exists():
         raise HTTPException(409, "Generate this card image before uploading")
     try:
-        image = Path(card["image_path"])
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                endpoint,
-                files={"file": (image.name, image.read_bytes(), "image/png")},
-                data={
-                    "word": card["word"],
-                    "width": str(WIDTH),
-                    "height": str(HEIGHT),
-                    "colours": "black,white,red",
-                },
-                headers=(
-                    {"Authorization": f"Bearer {os.getenv('EPD_API_TOKEN')}"}
-                    if os.getenv("EPD_API_TOKEN")
-                    else {}
-                ),
+        endpoint = endpoint.rstrip("/")
+        headers = (
+            {"Authorization": f"Bearer {os.getenv('EPD_API_TOKEN')}"}
+            if os.getenv("EPD_API_TOKEN")
+            else {}
+        )
+        frame = epd_frame(Path(card["image_path"]))
+        async with httpx.AsyncClient(timeout=90) as client:
+            panel_response = await client.post(
+                f"{endpoint}/api/panel",
+                data={"panelType": EPD_PANEL_TYPE, "colorMode": EPD_COLOR_MODE},
+                headers=headers,
             )
-            response.raise_for_status()
-    except httpx.HTTPError as exc:
+            panel_response.raise_for_status()
+            frame_response = await client.post(
+                f"{endpoint}/api/frame",
+                files={"frame": ("frame.bin", frame, "application/octet-stream")},
+                headers=headers,
+            )
+            frame_response.raise_for_status()
+    except (OSError, httpx.HTTPError) as exc:
         raise HTTPException(502, f"EPD gateway error: {exc}") from exc
-    return {"ok": True, "card_id": card_id, "endpoint": endpoint}
+    return {
+        "ok": True,
+        "card_id": card_id,
+        "endpoint": endpoint,
+        "panel_type": EPD_PANEL_TYPE,
+        "color_mode": EPD_COLOR_MODE,
+        "frame_bytes": len(frame),
+    }

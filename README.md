@@ -18,7 +18,7 @@ uv run --env-file .env uvicorn main:app --reload
 1. 新建单词本，并将一个单词加入任意多个单词本；也可在词卡上直接调整归属。
 2. 输入单词后点击“自动补全”：服务从 Dictionary API 获取 IPA 与简明释义，并用本地规则估算音节。结果是可编辑的建议，不会覆盖手工内容。超过 52 个字符的释义不会显示在闪卡上，也不会传给图片生成模型。
 3. 单张“强制重新生成”必定调用 OpenAI；“后台批量生成”会跳过已存在的 `data/cards/<word>.png`，并在网页显示进度与失败状态。
-4. 点击“发送至 EPD”：服务会向 `EPD_UPLOAD_URL` 以 `multipart/form-data` 上传字段 `file`（PNG）、`word`、`width`、`height` 与 `colours`。若网关需要认证，填入 `EPD_API_TOKEN`，会作为 Bearer token 发送。
+4. 在 `.env` 设置 `EPD_UPLOAD_URL=http://<ESP32 地址>` 后，点击“发送至 EPD”：服务会将 400×300 的闪卡量化为白、红、黑三色，先调用 ESP32 的 `/api/panel` 选择 `gdey042z98` / `tricolor`，再向 `/api/frame` 上传 30,000 字节帧数据以刷新屏幕。若网关需要认证，填入 `EPD_API_TOKEN`，会作为 Bearer token 发送。
 
 ## API
 
@@ -36,7 +36,7 @@ uv run --env-file .env uvicorn main:app --reload
 | GET /api/images/progress | 查询批量生成进度 |
 | GET /api/cards/{id}/image | 获取 400×300 PNG |
 | POST /api/cards/{id}/review | 记录一次复习 |
-| POST /api/cards/{id}/epd | 上传 PNG 到 EPD 网关 |
+| POST /api/cards/{id}/epd | 转换为 4.2 英寸三色帧并刷新 ESP32 EPD |
 
 `POST /api/cards` 的请求体示例：
 

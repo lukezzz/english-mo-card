@@ -12,3 +12,4 @@ wheels/
 # Application data and secrets
 data/
 .env
+.DS_Store

@@ -86,6 +86,34 @@ def add_column(conn: sqlite3.Connection, name: str, definition: str) -> None:
         conn.execute(f"ALTER TABLE cards ADD COLUMN {name} {definition}")
 
 
+def stored_image_path(path: Path) -> str:
+    """Store image locations relative to data/ so deployments remain portable."""
+    return (Path("cards") / path.name).as_posix()
+
+
+def resolve_image_path(stored_path: str | None) -> Path | None:
+    if not stored_path:
+        return None
+    path = Path(stored_path)
+    # Absolute entries are legacy records; use the copied image in data/cards.
+    return IMAGE_DIR / path.name if path.is_absolute() else DATA_DIR / path
+
+
+def migrate_image_paths(conn: sqlite3.Connection) -> None:
+    """Convert legacy absolute image paths to portable data-relative paths."""
+    rows = conn.execute(
+        "SELECT id, image_path FROM cards WHERE image_path IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        path = Path(row["image_path"])
+        portable_path = stored_image_path(path)
+        if row["image_path"] != portable_path:
+            conn.execute(
+                "UPDATE cards SET image_path=? WHERE id=?",
+                (portable_path, row["id"]),
+            )
+
+
 def initialize() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     IMAGE_DIR.mkdir(exist_ok=True)
@@ -97,6 +125,7 @@ def initialize() -> None:
         )""")
         add_column(conn, "image_status", "TEXT NOT NULL DEFAULT 'pending'")
         add_column(conn, "image_error", "TEXT")
+        migrate_image_paths(conn)
         conn.execute("""CREATE TABLE IF NOT EXISTS books (
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
         )""")
@@ -155,7 +184,7 @@ def card_books(conn: sqlite3.Connection, card_id: int) -> list[dict]:
 
 def serialize(row: sqlite3.Row, conn: sqlite3.Connection | None = None) -> dict:
     card = dict(row)
-    path = Path(card["image_path"]) if card["image_path"] else None
+    path = resolve_image_path(card["image_path"])
     card["image_url"] = (
         f"/api/cards/{card['id']}/image" if path and path.exists() else None
     )
@@ -229,7 +258,15 @@ def random_ready_card_id(book_id: int | None) -> int | None:
                  AND (? IS NULL OR cb.book_id=?) ORDER BY RANDOM()""",
             (book_id, book_id),
         ).fetchall()
-    return next((row["id"] for row in rows if Path(row["image_path"]).exists()), None)
+    return next(
+        (
+            row["id"]
+            for row in rows
+            if (image_path := resolve_image_path(row["image_path"]))
+            and image_path.exists()
+        ),
+        None,
+    )
 
 
 async def run_auto_refresh() -> None:
@@ -499,8 +536,8 @@ def update_card_books(card_id: int, payload: MembershipInput) -> dict:
 @app.delete("/api/cards/{card_id}", status_code=204)
 def delete_card(card_id: int) -> None:
     card = get_card(card_id)
-    if card["image_path"]:
-        Path(card["image_path"]).unlink(missing_ok=True)
+    if image_path := resolve_image_path(card["image_path"]):
+        image_path.unlink(missing_ok=True)
     with connection() as conn:
         conn.execute("DELETE FROM cards WHERE id=?", (card_id,))
 
@@ -685,7 +722,7 @@ def generate_one(card_id: int, force: bool) -> dict:
         with connection() as conn:
             conn.execute(
                 "UPDATE cards SET image_path=?, image_status='ready', image_error=NULL WHERE id=?",
-                (str(expected_path), card_id),
+                (stored_image_path(expected_path), card_id),
             )
             return serialize(
                 conn.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone(),
@@ -701,7 +738,7 @@ def generate_one(card_id: int, force: bool) -> dict:
         with connection() as conn:
             conn.execute(
                 "UPDATE cards SET image_path=?, image_status='ready', image_error=NULL WHERE id=?",
-                (str(path), card_id),
+                (stored_image_path(path), card_id),
             )
             return serialize(
                 conn.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone(),
@@ -777,10 +814,11 @@ def image_progress(book_id: int | None = None) -> dict:
 @app.get("/api/cards/{card_id}/image")
 def card_image(card_id: int) -> FileResponse:
     card = get_card(card_id)
-    if not card["image_path"] or not Path(card["image_path"]).exists():
+    image_path = resolve_image_path(card["image_path"])
+    if not image_path or not image_path.exists():
         raise HTTPException(404, "Generate this card image first")
     return FileResponse(
-        card["image_path"],
+        image_path,
         media_type="image/png",
         filename=image_filename(card["word"]),
     )
@@ -803,7 +841,8 @@ async def send_card_to_epd(card_id: int) -> dict:
     card, endpoint = get_card(card_id), os.getenv("EPD_UPLOAD_URL")
     if not endpoint:
         raise HTTPException(503, "EPD_UPLOAD_URL is not configured")
-    if not card["image_path"] or not Path(card["image_path"]).exists():
+    image_path = resolve_image_path(card["image_path"])
+    if not image_path or not image_path.exists():
         raise HTTPException(409, "Generate this card image before uploading")
     try:
         endpoint = endpoint.rstrip("/")
@@ -812,7 +851,7 @@ async def send_card_to_epd(card_id: int) -> dict:
             if os.getenv("EPD_API_TOKEN")
             else {}
         )
-        frame = epd_frame(Path(card["image_path"]))
+        frame = epd_frame(image_path)
         async with EPD_SEND_LOCK:
             async with httpx.AsyncClient(timeout=90) as client:
                 panel_response = await client.post(

@@ -3,6 +3,22 @@ const template = document.querySelector('#card-template');
 let books = [], polling, searchTimer, autoRefreshTimer;
 let page = 1, totalPages = 1;
 
+const viewMeta = {
+  cards: ['我的单词', '浏览、复习并发送已保存的闪卡。'],
+  create: ['新建闪卡', '从一个单词开始，做出专属的记忆卡。'],
+  bulk: ['批量添加', '把一组新词一次整理进来。'],
+  books: ['单词本', '用主题和课程把单词整理好。'],
+  epd: ['EPD 自动刷新', '让墨水屏按设定的节奏展示闪卡。'],
+};
+function showView(view) {
+  if (!viewMeta[view]) return;
+  document.querySelectorAll('[data-view-panel]').forEach(panel => panel.classList.toggle('active', panel.dataset.viewPanel === view));
+  document.querySelectorAll('[data-view]').forEach(item => item.classList.toggle('active', item.dataset.view === view));
+  document.querySelector('#page-title').textContent = viewMeta[view][0];
+  document.querySelector('#page-description').textContent = viewMeta[view][1];
+  history.replaceState(null, '', `#${view}`);
+}
+
 const api = async (url, options = {}) => {
   const response = await fetch(url, options);
   if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || '请求失败');
@@ -119,4 +135,6 @@ document.querySelector('#search').oninput = () => { clearTimeout(searchTimer); s
 document.querySelector('#previous').onclick = () => { if (page > 1) { page--; render(); }};
 document.querySelector('#next').onclick = () => { if (page < totalPages) { page++; render(); }};
 document.querySelector('#refresh').onclick = render;
-(async () => { await loadBooks(); await loadAutoRefresh(); render(); autoRefreshTimer = setInterval(() => loadAutoRefresh().catch(() => {}), 10000); })();
+document.querySelectorAll('[data-view]').forEach(item => item.onclick = () => showView(item.dataset.view));
+document.querySelectorAll('[data-view-link]').forEach(item => item.onclick = event => { event.preventDefault(); showView(item.dataset.viewLink); });
+(async () => { showView(location.hash.slice(1) || 'cards'); await loadBooks(); await loadAutoRefresh(); render(); autoRefreshTimer = setInterval(() => loadAutoRefresh().catch(() => {}), 10000); })();

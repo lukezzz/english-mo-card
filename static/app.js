@@ -1,6 +1,6 @@
 const cards = document.querySelector('#cards');
 const template = document.querySelector('#card-template');
-let books = [], polling, searchTimer;
+let books = [], polling, searchTimer, autoRefreshTimer;
 let page = 1, totalPages = 1;
 
 const api = async (url, options = {}) => {
@@ -18,6 +18,9 @@ function refreshBookControls() {
   const filter = document.querySelector('#book-filter'), previous = filter.value;
   filter.innerHTML = '<option value="">全部单词本</option>' + books.map(book => `<option value="${book.id}">${escapeHtml(book.name)} (${book.card_count})</option>`).join('');
   filter.value = previous;
+  const autoBook = document.querySelector('#auto-epd-book'), autoPrevious = autoBook.value;
+  autoBook.innerHTML = '<option value="">全部单词</option>' + books.map(book => `<option value="${book.id}">${escapeHtml(book.name)}</option>`).join('');
+  autoBook.value = autoPrevious;
   document.querySelectorAll('[data-book-picker]').forEach(picker => fillPicker(picker, checkedIds(picker)));
   document.querySelector('#book-list').innerHTML = books.length ? books.map(book => `<span class="tag">${escapeHtml(book.name)} <small>${book.card_count}</small> <button data-delete-book="${book.id}" title="删除单词本">×</button></span>`).join('') : '<span class="help">还没有单词本</span>';
   document.querySelectorAll('[data-delete-book]').forEach(button => button.onclick = async () => {
@@ -29,6 +32,27 @@ function refreshBookControls() {
   });
 }
 async function loadBooks() { books = await api('/api/books'); refreshBookControls(); }
+function autoRefreshDetail(settings) {
+  const scope = settings.book_name || '全部单词';
+  const last = settings.last_card_word ? `上次发送：${escapeHtml(settings.last_card_word)}。` : '尚未发送。';
+  const error = settings.last_error ? ` 最近错误：${escapeHtml(settings.last_error)}` : '';
+  return `范围：${escapeHtml(scope)}，可发送 ${settings.eligible_cards} 张。${last}${error}`;
+}
+function renderAutoRefresh(settings) {
+  const form = document.querySelector('#auto-epd-form');
+  form.book_id.value = settings.book_id || '';
+  form.interval_minutes.value = settings.interval_minutes;
+  const state = document.querySelector('#auto-epd-state');
+  state.textContent = settings.enabled ? '自动刷新中' : '已停止';
+  state.className = `status ${settings.enabled ? 'ready' : ''}`;
+  document.querySelector('#auto-epd-detail').innerHTML = autoRefreshDetail(settings);
+}
+async function loadAutoRefresh() { renderAutoRefresh(await api('/api/epd/auto-refresh')); }
+async function setAutoRefresh(enabled) {
+  const form = document.querySelector('#auto-epd-form');
+  const settings = await api('/api/epd/auto-refresh', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled, book_id:form.book_id.value ? Number(form.book_id.value) : null, interval_minutes:Number(form.interval_minutes.value)})});
+  renderAutoRefresh(settings);
+}
 function statusText(card) { return {pending:'待生成', generating:'生成中', ready:'已就绪', failed:'生成失败'}[card.image_status] || '待生成'; }
 function cardsUrl() {
   const params = new URLSearchParams({page, page_size: 24, sort: document.querySelector('#sort').value});
@@ -83,6 +107,8 @@ async function progress() {
 async function action(url, success) { try { await api(url, {method:'POST'}); await render(); alert(success); } catch(error) { alert(error.message); } }
 
 document.querySelector('#book-form').onsubmit = async event => { event.preventDefault(); try { await api('/api/books', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(Object.fromEntries(new FormData(event.target)))}); event.target.reset(); await loadBooks(); } catch(error) { alert(error.message); }};
+document.querySelector('#auto-epd-form').onsubmit = async event => { event.preventDefault(); try { await setAutoRefresh(true); } catch(error) { alert(error.message); }};
+document.querySelector('#auto-epd-stop').onclick = async () => { try { await setAutoRefresh(false); } catch(error) { alert(error.message); }};
 document.querySelector('#enrich').onclick = async () => { const form = document.querySelector('#create-form'), word = form.word.value.trim(); if (!word) return alert('请先输入单词'); try { const data = await api('/api/cards/enrich', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({word})}); form.ipa.value = data.ipa; form.syllables.value = data.syllables; form.hint.value = data.hint; } catch(error) { alert(error.message); }};
 document.querySelector('#create-form').onsubmit = async event => { event.preventDefault(); const form = event.target, payload = Object.fromEntries(new FormData(form)); payload.book_ids = checkedIds(form.querySelector('[data-book-picker]')); try { await api('/api/cards', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); form.reset(); fillPicker(form.querySelector('[data-book-picker]')); page = 1; await loadBooks(); render(); } catch(error) { alert(error.message); }};
 document.querySelector('#bulk-form').onsubmit = async event => { event.preventDefault(); const form = event.target, payload = {words:form.words.value, book_ids:checkedIds(form.querySelector('[data-book-picker]'))}; try { const result = await api('/api/cards/bulk', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); form.reset(); fillPicker(form.querySelector('[data-book-picker]')); document.querySelector('#bulk-result').textContent = `已新增 ${result.created_count} 项，后台正在自动补全；跳过 ${result.skipped.length} 项${result.skipped.length ? `（${result.skipped.slice(0, 3).map(item => item.word).join('、')}）` : ''}`; page = 1; await loadBooks(); render(); } catch(error) { alert(error.message); }};
@@ -93,4 +119,4 @@ document.querySelector('#search').oninput = () => { clearTimeout(searchTimer); s
 document.querySelector('#previous').onclick = () => { if (page > 1) { page--; render(); }};
 document.querySelector('#next').onclick = () => { if (page < totalPages) { page++; render(); }};
 document.querySelector('#refresh').onclick = render;
-(async () => { await loadBooks(); render(); })();
+(async () => { await loadBooks(); await loadAutoRefresh(); render(); autoRefreshTimer = setInterval(() => loadAutoRefresh().catch(() => {}), 10000); })();

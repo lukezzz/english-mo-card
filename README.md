@@ -19,6 +19,7 @@ uv run --env-file .env uvicorn main:app --reload
 2. 输入单词后点击“自动补全”：服务从 Dictionary API 获取 IPA 与简明释义，并用本地规则估算音节。批量导入会在后台自动补全新卡片，且不会覆盖已有手工内容。超过 52 个字符的释义不会显示在闪卡上，也不会传给图片生成模型。
 3. 单张“强制重新生成”必定调用 OpenAI；“后台批量生成”会跳过已存在的 `data/cards/<word>.png`，并在网页显示进度与失败状态。
 4. 在 `.env` 设置 `EPD_UPLOAD_URL=http://<ESP32 地址>` 后，点击“发送至 EPD”：服务会将 400×300 的闪卡量化为白、红、黑三色，先调用 ESP32 的 `/api/panel` 选择 `gdey042z98` / `tricolor`，再向 `/api/frame` 上传 30,000 字节帧数据以刷新屏幕。若网关需要认证，填入 `EPD_API_TOKEN`，会作为 Bearer token 发送。
+5. “EPD 自动刷新”可选择全部单词或一个单词本，并设置 1–1440 分钟的发送间隔（默认 10 分钟）。服务会从范围内已生成的闪卡随机抽取一张发送；配置保存在数据库，关闭管理页面后仍会继续，点击“停止”即可暂停。
 
 ## API
 
@@ -38,6 +39,7 @@ uv run --env-file .env uvicorn main:app --reload
 | GET /api/cards/{id}/image | 获取 400×300 PNG |
 | POST /api/cards/{id}/review | 记录一次复习 |
 | POST /api/cards/{id}/epd | 转换为 4.2 英寸三色帧并刷新 ESP32 EPD |
+| GET/PUT /api/epd/auto-refresh | 查询或设置 EPD 自动刷新 |
 
 `POST /api/cards` 的请求体示例：
 

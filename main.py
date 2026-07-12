@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import io
 import os
 import re
@@ -31,6 +32,7 @@ EPD_FRAME_BYTES = WIDTH * HEIGHT // 4
 VOWELS = set("aeiouAEIOU")
 BATCH_RUNNING = False
 MAX_CARD_HINT_LENGTH = 52
+EPD_SEND_LOCK = asyncio.Lock()
 
 
 class CardInput(BaseModel):
@@ -59,6 +61,12 @@ class MembershipInput(BaseModel):
 
 class EnrichInput(BaseModel):
     word: str = Field(min_length=1, max_length=60)
+
+
+class EpdAutoRefreshInput(BaseModel):
+    enabled: bool = False
+    book_id: int | None = None
+    interval_minutes: int = Field(default=10, ge=1, le=1440)
 
 
 def now() -> str:
@@ -97,12 +105,31 @@ def initialize() -> None:
             book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
             PRIMARY KEY (card_id, book_id)
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS epd_auto_refresh (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            enabled INTEGER NOT NULL DEFAULT 0,
+            book_id INTEGER REFERENCES books(id) ON DELETE SET NULL,
+            interval_minutes INTEGER NOT NULL DEFAULT 10,
+            last_card_id INTEGER REFERENCES cards(id) ON DELETE SET NULL,
+            last_attempt_at TEXT,
+            last_sent_at TEXT,
+            last_error TEXT
+        )""")
+        conn.execute("INSERT OR IGNORE INTO epd_auto_refresh (id) VALUES (1)")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize()
-    yield
+    task = asyncio.create_task(auto_refresh_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="EPD English Flash Cards", lifespan=lifespan)
@@ -158,6 +185,96 @@ def set_memberships(
     )
 
 
+def auto_refresh_settings() -> dict:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM epd_auto_refresh WHERE id=1").fetchone()
+        eligible_cards = conn.execute(
+            """SELECT count(DISTINCT c.id) FROM cards c
+               LEFT JOIN card_books cb ON cb.card_id=c.id
+               WHERE c.image_status='ready' AND c.image_path IS NOT NULL
+                 AND (? IS NULL OR cb.book_id=?)""",
+            (row["book_id"], row["book_id"]),
+        ).fetchone()[0]
+        book = (
+            conn.execute("SELECT name FROM books WHERE id=?", (row["book_id"],)).fetchone()
+            if row["book_id"] is not None
+            else None
+        )
+        card = (
+            conn.execute("SELECT word FROM cards WHERE id=?", (row["last_card_id"],)).fetchone()
+            if row["last_card_id"] is not None
+            else None
+        )
+    settings = dict(row)
+    settings["enabled"] = bool(settings["enabled"])
+    settings["eligible_cards"] = eligible_cards
+    settings["book_name"] = book["name"] if book else None
+    settings["last_card_word"] = card["word"] if card else None
+    return settings
+
+
+def auto_refresh_due(settings: dict) -> bool:
+    if not settings["enabled"] or not settings["last_attempt_at"]:
+        return settings["enabled"]
+    last_attempt = datetime.fromisoformat(settings["last_attempt_at"])
+    return (datetime.now(UTC) - last_attempt).total_seconds() >= settings["interval_minutes"] * 60
+
+
+def random_ready_card_id(book_id: int | None) -> int | None:
+    with connection() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT c.id, c.image_path FROM cards c
+               LEFT JOIN card_books cb ON cb.card_id=c.id
+               WHERE c.image_status='ready' AND c.image_path IS NOT NULL
+                 AND (? IS NULL OR cb.book_id=?) ORDER BY RANDOM()""",
+            (book_id, book_id),
+        ).fetchall()
+    return next((row["id"] for row in rows if Path(row["image_path"]).exists()), None)
+
+
+async def run_auto_refresh() -> None:
+    settings = auto_refresh_settings()
+    if not settings["enabled"]:
+        return
+    card_id = random_ready_card_id(settings["book_id"])
+    attempted_at = now()
+    if card_id is None:
+        with connection() as conn:
+            conn.execute(
+                "UPDATE epd_auto_refresh SET last_attempt_at=?, last_error=? WHERE id=1",
+                (attempted_at, "没有已生成、可发送的闪卡"),
+            )
+        return
+    try:
+        await send_card_to_epd(card_id)
+    except HTTPException as exc:
+        with connection() as conn:
+            conn.execute(
+                "UPDATE epd_auto_refresh SET last_attempt_at=?, last_error=? WHERE id=1",
+                (attempted_at, str(exc.detail)[:300]),
+            )
+        return
+    with connection() as conn:
+        conn.execute(
+            """UPDATE epd_auto_refresh
+               SET last_attempt_at=?, last_sent_at=?, last_card_id=?, last_error=NULL WHERE id=1""",
+            (attempted_at, attempted_at, card_id),
+        )
+
+
+async def auto_refresh_loop() -> None:
+    """Keep the EPD rotation alive independently from an open browser tab."""
+    while True:
+        await asyncio.sleep(5)
+        try:
+            settings = auto_refresh_settings()
+            if auto_refresh_due(settings):
+                await run_auto_refresh()
+        except Exception:
+            # Individual failures are stored by run_auto_refresh; keep the scheduler alive.
+            pass
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     return HTMLResponse((ROOT / "templates" / "index.html").read_text())
@@ -170,6 +287,27 @@ def health() -> dict:
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
         "epd_configured": bool(os.getenv("EPD_UPLOAD_URL")),
     }
+
+
+@app.get("/api/epd/auto-refresh")
+def get_auto_refresh() -> dict:
+    return auto_refresh_settings()
+
+
+@app.put("/api/epd/auto-refresh")
+def update_auto_refresh(payload: EpdAutoRefreshInput) -> dict:
+    with connection() as conn:
+        if payload.book_id is not None and not conn.execute(
+            "SELECT 1 FROM books WHERE id=?", (payload.book_id,)
+        ).fetchone():
+            raise HTTPException(422, "Word book does not exist")
+        conn.execute(
+            """UPDATE epd_auto_refresh
+               SET enabled=?, book_id=?, interval_minutes=?, last_attempt_at=NULL,
+                   last_error=NULL WHERE id=1""",
+            (payload.enabled, payload.book_id, payload.interval_minutes),
+        )
+    return auto_refresh_settings()
 
 
 @app.get("/api/books")
@@ -661,8 +799,7 @@ def review_card(card_id: int) -> dict:
         )
 
 
-@app.post("/api/cards/{card_id}/epd")
-async def upload_to_epd(card_id: int) -> dict:
+async def send_card_to_epd(card_id: int) -> dict:
     card, endpoint = get_card(card_id), os.getenv("EPD_UPLOAD_URL")
     if not endpoint:
         raise HTTPException(503, "EPD_UPLOAD_URL is not configured")
@@ -676,19 +813,20 @@ async def upload_to_epd(card_id: int) -> dict:
             else {}
         )
         frame = epd_frame(Path(card["image_path"]))
-        async with httpx.AsyncClient(timeout=90) as client:
-            panel_response = await client.post(
-                f"{endpoint}/api/panel",
-                data={"panelType": EPD_PANEL_TYPE, "colorMode": EPD_COLOR_MODE},
-                headers=headers,
-            )
-            panel_response.raise_for_status()
-            frame_response = await client.post(
-                f"{endpoint}/api/frame",
-                files={"frame": ("frame.bin", frame, "application/octet-stream")},
-                headers=headers,
-            )
-            frame_response.raise_for_status()
+        async with EPD_SEND_LOCK:
+            async with httpx.AsyncClient(timeout=90) as client:
+                panel_response = await client.post(
+                    f"{endpoint}/api/panel",
+                    data={"panelType": EPD_PANEL_TYPE, "colorMode": EPD_COLOR_MODE},
+                    headers=headers,
+                )
+                panel_response.raise_for_status()
+                frame_response = await client.post(
+                    f"{endpoint}/api/frame",
+                    files={"frame": ("frame.bin", frame, "application/octet-stream")},
+                    headers=headers,
+                )
+                frame_response.raise_for_status()
     except (OSError, httpx.HTTPError) as exc:
         raise HTTPException(502, f"EPD gateway error: {exc}") from exc
     return {
@@ -699,3 +837,8 @@ async def upload_to_epd(card_id: int) -> dict:
         "color_mode": EPD_COLOR_MODE,
         "frame_bytes": len(frame),
     }
+
+
+@app.post("/api/cards/{card_id}/epd")
+async def upload_to_epd(card_id: int) -> dict:
+    return await send_card_to_epd(card_id)

@@ -225,12 +225,16 @@ def auto_refresh_settings() -> dict:
             (row["book_id"], row["book_id"]),
         ).fetchone()[0]
         book = (
-            conn.execute("SELECT name FROM books WHERE id=?", (row["book_id"],)).fetchone()
+            conn.execute(
+                "SELECT name FROM books WHERE id=?", (row["book_id"],)
+            ).fetchone()
             if row["book_id"] is not None
             else None
         )
         card = (
-            conn.execute("SELECT word FROM cards WHERE id=?", (row["last_card_id"],)).fetchone()
+            conn.execute(
+                "SELECT word FROM cards WHERE id=?", (row["last_card_id"],)
+            ).fetchone()
             if row["last_card_id"] is not None
             else None
         )
@@ -246,7 +250,9 @@ def auto_refresh_due(settings: dict) -> bool:
     if not settings["enabled"] or not settings["last_attempt_at"]:
         return settings["enabled"]
     last_attempt = datetime.fromisoformat(settings["last_attempt_at"])
-    return (datetime.now(UTC) - last_attempt).total_seconds() >= settings["interval_minutes"] * 60
+    return (datetime.now(UTC) - last_attempt).total_seconds() >= settings[
+        "interval_minutes"
+    ] * 60
 
 
 def random_ready_card_id(book_id: int | None) -> int | None:
@@ -334,9 +340,12 @@ def get_auto_refresh() -> dict:
 @app.put("/api/epd/auto-refresh")
 def update_auto_refresh(payload: EpdAutoRefreshInput) -> dict:
     with connection() as conn:
-        if payload.book_id is not None and not conn.execute(
-            "SELECT 1 FROM books WHERE id=?", (payload.book_id,)
-        ).fetchone():
+        if (
+            payload.book_id is not None
+            and not conn.execute(
+                "SELECT 1 FROM books WHERE id=?", (payload.book_id,)
+            ).fetchone()
+        ):
             raise HTTPException(422, "Word book does not exist")
         conn.execute(
             """UPDATE epd_auto_refresh
@@ -411,10 +420,24 @@ def list_cards(
             params.append(f"%{q.strip().casefold()}%")
         source = "FROM cards c " + " ".join(joins)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        total = conn.execute("SELECT count(DISTINCT c.id) " + source + where, params).fetchone()[0]
+        total = conn.execute(
+            "SELECT count(DISTINCT c.id) " + source + where, params
+        ).fetchone()[0]
         offset = (page - 1) * page_size
-        rows = conn.execute("SELECT DISTINCT c.* " + source + where + f" ORDER BY {sort_order} LIMIT ? OFFSET ?", [*params, page_size, offset]).fetchall()
-        return {"items": [serialize(row, conn) for row in rows], "total": total, "page": page, "page_size": page_size, "total_pages": max((total + page_size - 1) // page_size, 1)}
+        rows = conn.execute(
+            "SELECT DISTINCT c.* "
+            + source
+            + where
+            + f" ORDER BY {sort_order} LIMIT ? OFFSET ?",
+            [*params, page_size, offset],
+        ).fetchall()
+        return {
+            "items": [serialize(row, conn) for row in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": max((total + page_size - 1) // page_size, 1),
+        }
 
 
 @app.post("/api/cards", status_code=201)
@@ -457,7 +480,9 @@ def normalize_bulk_word(raw: str) -> str:
 
 
 @app.post("/api/cards/bulk", status_code=201)
-def create_cards_bulk(payload: BulkCardCreate, background_tasks: BackgroundTasks) -> dict:
+def create_cards_bulk(
+    payload: BulkCardCreate, background_tasks: BackgroundTasks
+) -> dict:
     """Create cards from one pasted item per line, preserving valid phrases/capitalization."""
     candidates: list[str] = []
     skipped: list[dict] = []
@@ -468,9 +493,21 @@ def create_cards_bulk(payload: BulkCardCreate, background_tasks: BackgroundTasks
         if not word:
             continue
         if not re.search(r"[A-Za-z]", word) or len(word) > 60:
-            skipped.append({"line": line_number, "word": raw, "reason": "not a valid English word or phrase"})
+            skipped.append(
+                {
+                    "line": line_number,
+                    "word": raw,
+                    "reason": "not a valid English word or phrase",
+                }
+            )
         elif key in seen:
-            skipped.append({"line": line_number, "word": word, "reason": "duplicate in pasted list"})
+            skipped.append(
+                {
+                    "line": line_number,
+                    "word": word,
+                    "reason": "duplicate in pasted list",
+                }
+            )
         else:
             seen.add(key)
             candidates.append(word)
@@ -479,7 +516,9 @@ def create_cards_bulk(payload: BulkCardCreate, background_tasks: BackgroundTasks
     with connection() as conn:
         book_ids = ensure_book_ids(conn, payload.book_ids)
         for word in candidates:
-            if conn.execute("SELECT 1 FROM cards WHERE lower(word)=lower(?)", (word,)).fetchone():
+            if conn.execute(
+                "SELECT 1 FROM cards WHERE lower(word)=lower(?)", (word,)
+            ).fetchone():
                 skipped.append({"word": word, "reason": "already exists"})
                 continue
             cursor = conn.execute(
@@ -487,11 +526,23 @@ def create_cards_bulk(payload: BulkCardCreate, background_tasks: BackgroundTasks
                 (word, now()),
             )
             set_memberships(conn, cursor.lastrowid, book_ids)
-            created.append(serialize(conn.execute("SELECT * FROM cards WHERE id=?", (cursor.lastrowid,)).fetchone(), conn))
+            created.append(
+                serialize(
+                    conn.execute(
+                        "SELECT * FROM cards WHERE id=?", (cursor.lastrowid,)
+                    ).fetchone(),
+                    conn,
+                )
+            )
     created_ids = [card["id"] for card in created]
     if created_ids:
         background_tasks.add_task(enrich_cards, created_ids)
-    return {"created": created, "created_count": len(created), "skipped": skipped, "enrichment_queued": len(created_ids)}
+    return {
+        "created": created,
+        "created_count": len(created),
+        "skipped": skipped,
+        "enrichment_queued": len(created_ids),
+    }
 
 
 @app.put("/api/cards/{card_id}")
@@ -589,7 +640,12 @@ def enrich_cards(card_ids: list[int]) -> None:
                     """UPDATE cards SET ipa=CASE WHEN ipa='' THEN ? ELSE ipa END,
                        syllables=CASE WHEN syllables='' THEN ? ELSE syllables END,
                        hint=CASE WHEN hint='' THEN ? ELSE hint END WHERE id=?""",
-                    (suggestion["ipa"], suggestion["syllables"], suggestion["hint"], card_id),
+                    (
+                        suggestion["ipa"],
+                        suggestion["syllables"],
+                        suggestion["hint"],
+                        card_id,
+                    ),
                 )
         except (HTTPException, sqlite3.Error):
             continue
@@ -622,7 +678,9 @@ def draw_coloured_word(draw: ImageDraw.ImageDraw, word: str, y: int) -> None:
 def child_friendly_hint(hint: str) -> str:
     """Keep a short memory cue, but never render dictionary-definition prose."""
     clean = " ".join(hint.split())
-    if len(clean) > MAX_CARD_HINT_LENGTH or any(mark in clean for mark in (";", ":", "(", ")")):
+    if len(clean) > MAX_CARD_HINT_LENGTH or any(
+        mark in clean for mark in (";", ":", "(", ")")
+    ):
         return ""
     return clean
 
@@ -853,7 +911,7 @@ async def send_card_to_epd(card_id: int) -> dict:
         )
         frame = epd_frame(image_path)
         async with EPD_SEND_LOCK:
-            async with httpx.AsyncClient(timeout=90) as client:
+            async with httpx.AsyncClient(trust_env=False) as client:
                 panel_response = await client.post(
                     f"{endpoint}/api/panel",
                     data={"panelType": EPD_PANEL_TYPE, "colorMode": EPD_COLOR_MODE},

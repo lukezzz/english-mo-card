@@ -16,7 +16,7 @@ uv run --env-file .env uvicorn main:app --reload
 ## 工作方式
 
 1. 新建单词本，并将一个单词加入任意多个单词本；也可在词卡上直接调整归属。
-2. 输入单词后点击“自动补全”：服务从 Dictionary API 获取 IPA 与简明释义，并用本地规则估算音节。结果是可编辑的建议，不会覆盖手工内容。超过 52 个字符的释义不会显示在闪卡上，也不会传给图片生成模型。
+2. 输入单词后点击“自动补全”：服务从 Dictionary API 获取 IPA 与简明释义，并用本地规则估算音节。批量导入会在后台自动补全新卡片，且不会覆盖已有手工内容。超过 52 个字符的释义不会显示在闪卡上，也不会传给图片生成模型。
 3. 单张“强制重新生成”必定调用 OpenAI；“后台批量生成”会跳过已存在的 `data/cards/<word>.png`，并在网页显示进度与失败状态。
 4. 在 `.env` 设置 `EPD_UPLOAD_URL=http://<ESP32 地址>` 后，点击“发送至 EPD”：服务会将 400×300 的闪卡量化为白、红、黑三色，先调用 ESP32 的 `/api/panel` 选择 `gdey042z98` / `tricolor`，再向 `/api/frame` 上传 30,000 字节帧数据以刷新屏幕。若网关需要认证，填入 `EPD_API_TOKEN`，会作为 Bearer token 发送。
 
@@ -24,8 +24,9 @@ uv run --env-file .env uvicorn main:app --reload
 
 | 方法 | 地址 | 作用 |
 | --- | --- | --- |
-| GET /api/cards | 列出单词卡 |
+| GET /api/cards | 分页列出单词卡；支持 `page`、`page_size`、`q`、`sort` 和 `book_id` |
 | POST /api/cards | 新建单词卡 |
+| POST /api/cards/bulk | 从逐行文本批量新建单词卡 |
 | PUT /api/cards/{id} | 修改词卡文字资料 |
 | PUT /api/cards/{id}/books | 替换该单词所属的单词本 |
 | DELETE /api/cards/{id} | 删除词卡与本地图片 |

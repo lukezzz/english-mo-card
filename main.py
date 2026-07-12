@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import textwrap
+import unicodedata
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +41,11 @@ class CardInput(BaseModel):
 
 
 class CardCreate(CardInput):
+    book_ids: list[int] = []
+
+
+class BulkCardCreate(BaseModel):
+    words: str = Field(min_length=1, max_length=20_000)
     book_ids: list[int] = []
 
 
@@ -204,15 +210,36 @@ def delete_book(book_id: int) -> None:
 
 
 @app.get("/api/cards")
-def list_cards(book_id: int | None = None) -> list[dict]:
+def list_cards(
+    book_id: int | None = None,
+    q: str = "",
+    sort: str = "created_desc",
+    page: int = 1,
+    page_size: int = 24,
+) -> dict:
+    sort_order = {
+        "created_desc": "c.id DESC",
+        "created_asc": "c.id ASC",
+        "word_asc": "lower(c.word) ASC",
+        "word_desc": "lower(c.word) DESC",
+        "review_desc": "c.review_count DESC, c.id DESC",
+    }.get(sort, "c.id DESC")
+    page, page_size = max(page, 1), min(max(page_size, 1), 100)
     with connection() as conn:
-        query = "SELECT DISTINCT c.* FROM cards c"
-        params: list[int] = []
+        joins, clauses, params = [], [], []
         if book_id is not None:
-            query += " JOIN card_books cb ON cb.card_id=c.id WHERE cb.book_id=?"
+            joins.append("JOIN card_books cb ON cb.card_id=c.id")
+            clauses.append("cb.book_id=?")
             params.append(book_id)
-        rows = conn.execute(query + " ORDER BY c.id DESC", params).fetchall()
-        return [serialize(row, conn) for row in rows]
+        if q.strip():
+            clauses.append("lower(c.word) LIKE ?")
+            params.append(f"%{q.strip().casefold()}%")
+        source = "FROM cards c " + " ".join(joins)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        total = conn.execute("SELECT count(DISTINCT c.id) " + source + where, params).fetchone()[0]
+        offset = (page - 1) * page_size
+        rows = conn.execute("SELECT DISTINCT c.* " + source + where + f" ORDER BY {sort_order} LIMIT ? OFFSET ?", [*params, page_size, offset]).fetchall()
+        return {"items": [serialize(row, conn) for row in rows], "total": total, "page": page, "page_size": page_size, "total_pages": max((total + page_size - 1) // page_size, 1)}
 
 
 @app.post("/api/cards", status_code=201)
@@ -244,6 +271,52 @@ def create_card(payload: CardCreate) -> dict:
             )
     except sqlite3.IntegrityError as exc:
         raise HTTPException(409, "This word already exists") from exc
+
+
+def normalize_bulk_word(raw: str) -> str:
+    """Normalize pasted lists while retaining English phrase wording and casing."""
+    word = unicodedata.normalize("NFKC", raw).strip()
+    word = re.sub(r"^(?:[-*•]+|\d+[.)])\s*", "", word)
+    word = word.replace("’", "'").replace("‘", "'").replace("–", "-").replace("—", "-")
+    return re.sub(r"\s+", " ", word).strip(" \t\"'.,，。!！?？:：;；")
+
+
+@app.post("/api/cards/bulk", status_code=201)
+def create_cards_bulk(payload: BulkCardCreate, background_tasks: BackgroundTasks) -> dict:
+    """Create cards from one pasted item per line, preserving valid phrases/capitalization."""
+    candidates: list[str] = []
+    skipped: list[dict] = []
+    seen: set[str] = set()
+    for line_number, raw in enumerate(payload.words.splitlines(), start=1):
+        word = normalize_bulk_word(raw)
+        key = word.casefold()
+        if not word:
+            continue
+        if not re.search(r"[A-Za-z]", word) or len(word) > 60:
+            skipped.append({"line": line_number, "word": raw, "reason": "not a valid English word or phrase"})
+        elif key in seen:
+            skipped.append({"line": line_number, "word": word, "reason": "duplicate in pasted list"})
+        else:
+            seen.add(key)
+            candidates.append(word)
+
+    created: list[dict] = []
+    with connection() as conn:
+        book_ids = ensure_book_ids(conn, payload.book_ids)
+        for word in candidates:
+            if conn.execute("SELECT 1 FROM cards WHERE lower(word)=lower(?)", (word,)).fetchone():
+                skipped.append({"word": word, "reason": "already exists"})
+                continue
+            cursor = conn.execute(
+                "INSERT INTO cards (word, created_at, image_status) VALUES (?, ?, 'pending')",
+                (word, now()),
+            )
+            set_memberships(conn, cursor.lastrowid, book_ids)
+            created.append(serialize(conn.execute("SELECT * FROM cards WHERE id=?", (cursor.lastrowid,)).fetchone(), conn))
+    created_ids = [card["id"] for card in created]
+    if created_ids:
+        background_tasks.add_task(enrich_cards, created_ids)
+    return {"created": created, "created_count": len(created), "skipped": skipped, "enrichment_queued": len(created_ids)}
 
 
 @app.put("/api/cards/{card_id}")
@@ -302,9 +375,7 @@ def syllabify(word: str) -> str:
     return "-".join(parts) if len(parts) > 1 else word
 
 
-@app.post("/api/cards/enrich")
-def enrich_word(payload: EnrichInput) -> dict:
-    word = payload.word.strip()
+def enrichment_for(word: str) -> dict:
     result = {
         "word": word,
         "ipa": "",
@@ -330,6 +401,28 @@ def enrich_word(payload: EnrichInput) -> dict:
     except (httpx.HTTPError, ValueError, IndexError, KeyError):
         result["hint"] = f"a simple picture of {word}"
     return result
+
+
+def enrich_cards(card_ids: list[int]) -> None:
+    """Fill only blank fields so background enrichment never overwrites edits."""
+    for card_id in card_ids:
+        try:
+            card = get_card(card_id)
+            suggestion = enrichment_for(card["word"])
+            with connection() as conn:
+                conn.execute(
+                    """UPDATE cards SET ipa=CASE WHEN ipa='' THEN ? ELSE ipa END,
+                       syllables=CASE WHEN syllables='' THEN ? ELSE syllables END,
+                       hint=CASE WHEN hint='' THEN ? ELSE hint END WHERE id=?""",
+                    (suggestion["ipa"], suggestion["syllables"], suggestion["hint"], card_id),
+                )
+        except (HTTPException, sqlite3.Error):
+            continue
+
+
+@app.post("/api/cards/enrich")
+def enrich_word(payload: EnrichInput) -> dict:
+    return enrichment_for(payload.word.strip())
 
 
 def load_font(size: int) -> ImageFont.FreeTypeFont:

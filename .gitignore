@@ -13,3 +13,7 @@ wheels/
 data/
 .env
 .DS_Store
+
+# ESP32 local configuration and build output
+esp/src/config.h
+esp/.pio/

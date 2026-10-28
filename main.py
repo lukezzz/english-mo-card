@@ -911,7 +911,7 @@ async def send_card_to_epd(card_id: int) -> dict:
         )
         frame = epd_frame(image_path)
         async with EPD_SEND_LOCK:
-            async with httpx.AsyncClient(trust_env=False) as client:
+            async with httpx.AsyncClient(trust_env=False, timeout=120.0) as client:
                 panel_response = await client.post(
                     f"{endpoint}/api/panel",
                     data={"panelType": EPD_PANEL_TYPE, "colorMode": EPD_COLOR_MODE},

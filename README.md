@@ -46,3 +46,26 @@ uv run --env-file .env uvicorn main:app --reload
 ```json
 {"word":"apple","ipa":"/ˈæp.əl/","syllables":"ap-ple","hint":"a red apple"}
 ```
+
+## XIAO ESP32-C3 墨水屏接收端
+
+`esp/` 是 PlatformIO Arduino 固件。它连接 Wi-Fi，并在 80 端口接收本项目服务器推送的图片；设备与服务器需要能通过网络互相访问。
+
+1. 将 `esp/src/config.example.h` 复制为 `esp/src/config.h`，填写 `WIFI_SSID`、`WIFI_PASSWORD`。如需认证，设置 `EPD_API_TOKEN` 并与服务端 `.env` 中的同名值保持一致；留空则不验证。配置文件不会提交到 Git。
+2. 按下表连接屏幕驱动板；如接线不同，修改 `config.h` 中的 GPIO 编号。供电和电平请以所用屏幕驱动板规格为准。
+
+   | EPD 信号 | XIAO 引脚 | GPIO |
+   | --- | --- | --- |
+   | BUSY | D2 | 4 |
+   | CS | D1 | 3 |
+   | DC | D3 | 5 |
+   | RST | D0 | 2 |
+   | SCK / CLK | D8 | 8 |
+   | MOSI / DIN | D10 | 10 |
+
+   MISO 使用 D9 / GPIO9 初始化，但屏幕只接收数据，该引脚无需接线。固件会在 Wi-Fi 取得 IP 后启动 HTTP 服务，断线后暂停服务，并在重连后重新启动。
+
+3. 使用 PlatformIO 编译、烧录，并打开 115200 波特率串口监视器：`pio run -d esp -t upload`，然后 `pio device monitor -d esp -b 115200`。串口会显示连接状态、IP、每个接收数据块的大小、帧校验及刷新结果。
+4. 将服务端 `.env` 的 `EPD_UPLOAD_URL` 设置为串口打印的 `http://<设备 IP>`，重启服务，再从网页发送闪卡。设备断线后会自动重连；路由器中为设备保留 IP 可避免地址变化。
+
+服务端先通过 `POST /api/panel` 选择 `gdey042z98` 和 `tricolor`，再通过 `POST /api/frame` 的 multipart `frame` 字段发送 30,000 字节。每字节包含四个像素，从高位到低位分别为白色 `00`、红色 `10`、黑色 `11`。固件只接受完整帧，刷新成功后才返回成功；屏幕 BUSY 超时会返回错误。`GET /api/health` 可用于检查设备是否在线。

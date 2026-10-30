@@ -4,6 +4,9 @@
 #define WIFI_PASSWORD "your-wifi-password"
 // Optional: match EPD_API_TOKEN on the flash card server; leave empty to disable.
 #define EPD_API_TOKEN ""
+// Keep a small diagnostic history across reboot. Set 0 after troubleshooting
+// to stop flash logging (serial and HTTP diagnostics remain available).
+#define EPD_PERSIST_DEBUG 1
 
 // XIAO ESP32-C3 GPIO numbers. Adjust to match your EPD adapter wiring.
 #define EPD_PIN_BUSY 4  // D2

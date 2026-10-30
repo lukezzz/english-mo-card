@@ -919,9 +919,9 @@ async def send_card_to_epd(card_id: int) -> dict:
                 )
                 panel_response.raise_for_status()
                 frame_response = await client.post(
-                    f"{endpoint}/api/frame",
-                    files={"frame": ("frame.bin", frame, "application/octet-stream")},
-                    headers=headers,
+                    f"{endpoint}/api/frame/raw",
+                    content=frame,
+                    headers={**headers, "Content-Type": "application/octet-stream"},
                 )
                 frame_response.raise_for_status()
     except (OSError, httpx.HTTPError) as exc:
